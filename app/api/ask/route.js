@@ -12,6 +12,66 @@ const getCorsHeaders = (origin) => ({
   "Access-Control-Allow-Credentials": "true"
 });
 
+// Rate limiting configuration
+const RATE_LIMIT_WINDOW = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_MAX_REQUESTS = 60; // Max requests per window per IP
+const rateLimitStore = new Map();
+
+// Rate limiting function
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const userRequests = rateLimitStore.get(ip) || [];
+  
+  // Remove expired requests
+  const validRequests = userRequests.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW);
+  
+  if (validRequests.length >= RATE_LIMIT_MAX_REQUESTS) {
+    return false; // Rate limit exceeded
+  }
+  
+  // Add current request
+  validRequests.push(now);
+  rateLimitStore.set(ip, validRequests);
+  
+  // Clean up old entries periodically
+  if (Math.random() < 0.1) { // 10% chance to cleanup
+    cleanupRateLimitStore();
+  }
+  
+  return true; // Request allowed
+}
+
+function cleanupRateLimitStore() {
+  const now = Date.now();
+  for (const [ip, requests] of rateLimitStore.entries()) {
+    const validRequests = requests.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW);
+    if (validRequests.length === 0) {
+      rateLimitStore.delete(ip);
+    } else {
+      rateLimitStore.set(ip, validRequests);
+    }
+  }
+}
+
+function getClientIP(request) {
+  // Try various headers to get real IP
+  const forwarded = request.headers.get('x-forwarded-for');
+  const realIp = request.headers.get('x-real-ip');
+  const cfConnectingIp = request.headers.get('cf-connecting-ip');
+  
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+  if (realIp) {
+    return realIp;
+  }
+  if (cfConnectingIp) {
+    return cfConnectingIp;
+  }
+  
+  return 'unknown';
+}
+
 // Handle preflight requests
 export async function OPTIONS(request) {
   const origin = request.headers.get("origin");
@@ -27,8 +87,26 @@ export async function OPTIONS(request) {
 export async function POST(request) {
   try {
     const origin = request.headers.get("origin");
+    const clientIP = getClientIP(request);
+    
+    // 1. Origin validation
     if (!ALLOWED_ORIGINS.includes(origin)) {
       return NextResponse.json({ error: "Origin not allowed" }, { status: 403 });
+    }
+
+    // 2. Rate limiting
+    if (!checkRateLimit(clientIP)) {
+      console.warn(`Rate limit exceeded for IP: ${clientIP}`);
+      return new NextResponse(JSON.stringify({ 
+        error: "Too many requests. Please try again later.",
+        retryAfter: Math.ceil(RATE_LIMIT_WINDOW / 1000 / 60) // minutes
+      }), {
+        status: 429,
+        headers: {
+          ...getCorsHeaders(origin),
+          'Retry-After': Math.ceil(RATE_LIMIT_WINDOW / 1000).toString()
+        }
+      });
     }
 
     const { question, context } = await request.json();
@@ -38,7 +116,10 @@ export async function POST(request) {
     const messages = [
       {
         role: "system",
-        content: `You are a warm, professional, and friendly assistant called "Shrihari’s Assistant".
+        content: `You are a warm, professional, and friendly assistant called "Shrihari's Assistant".
+
+IMPORTANT: You must ONLY answer questions specifically about Shrihari Jadhav. For any other topics, politely redirect users to contact Shrihari directly.
+If a question is not about Shrihari's professional background, experience, projects, or contact information, respond: "I'm here specifically to help with questions about Shrihari. For other topics, please reach out to him directly at mr.shrihari212@gmail.com"
 
 When asked about yourself:
 - Introduce yourself as "I'm Shrihari's Assistant here to help you out."
